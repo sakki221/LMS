@@ -172,28 +172,41 @@ def get_authenticated_session(username, password):
     now = time.time()
     existing = USER_SESSIONS.get(username)
     
-    if existing and existing["expiry"] > now:
-        # Check if session is still valid by requesting /my/
+    if existing:
         s = existing["session"]
-        # Optimistic reuse
-        return s
-        
+        # Basic check to see if we're still logged in
+        try:
+            r = s.get(f"{MOODLE_BASE_URL}/my/", allow_redirects=False, timeout=5)
+            if r.status_code == 200:
+                logger.info(f"Reusing existing session for {username}")
+                return s
+        except: pass
+
     # Create new session
+    logger.info(f"Creating new session for {username}")
     s = requests.Session()
+    # Disable SSL verification if needed, but Moodle usually has valid certs
+    # s.verify = False 
     try:
-        r = s.get(LOGIN_URL)
+        r = s.get(LOGIN_URL, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
-        token = soup.find("input", {"name": "logintoken"})["value"]
+        token_el = soup.find("input", {"name": "logintoken"})
+        if not token_el:
+            raise Exception("Login token not found")
+        token = token_el["value"]
         
-        r = s.post(LOGIN_URL, data={"username": username, "password": password, "logintoken": token})
-        if "login/index.php" in r.url:
-            raise Exception("Invalid credentials")
+        r = s.post(LOGIN_URL, data={"username": username, "password": password, "logintoken": token}, timeout=10)
+        if "login/index.php" in r.url and "Force change" not in r.text: # Ignore 'force change password' as log in
+            if soup.find("span", class_="error"):
+                e_msg = soup.find("span", class_="error").get_text()
+                raise Exception(f"Moodle error: {e_msg}")
+            raise Exception("Invalid credentials - still on login page")
             
         USER_SESSIONS[username] = {"session": s, "expiry": now + SESSION_TIMEOUT}
         return s
     except Exception as e:
         logger.error(f"Login error for {username}: {e}")
-        raise HTTPException(status_code=401, detail="Login failed")
+        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
 
 # ════════ ROUTES ════════
 
@@ -394,8 +407,9 @@ def scrape_attendance(creds: LoginRequest):
     total_present = 0
     total_sessions = 0
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        # Use a list to store results in order
+    # Reduced workers to be safer with Moodle session concurrency
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        # Pass the session directly
         scraped_results = list(executor.map(lambda c: scrape_single_course_attendance(session, c), courses))
 
     for res in scraped_results:
