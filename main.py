@@ -23,13 +23,13 @@ from bs4 import BeautifulSoup
 from typing import Optional, List
 
 # ════════ LOGGING SETUP ════════
-if not os.path.exists("logs"):
-    os.makedirs("logs")
+# ════════ LOGGING SETUP ════════
+# Use stdout for Vercel compatibility
 logging.basicConfig(
-    filename='logs/backend.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 logger = logging.getLogger(__name__)
 
 # ════════ CONFIGURATION ════════
