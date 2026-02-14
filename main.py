@@ -21,6 +21,7 @@ import logging
 from datetime import datetime
 from bs4 import BeautifulSoup
 from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor
 
 # ════════ LOGGING SETUP ════════
 # ════════ LOGGING SETUP ════════
@@ -244,77 +245,40 @@ def scrape_dashboard(creds: LoginRequest):
     logger.info(f"Final course count: {len(courses_data)}")
     return DashboardResponse(success=True, user_name=user_name, courses=courses_data)
 
-@app.post("/scrape/attendance", response_model=AttendanceResponse)
-def scrape_attendance(creds: LoginRequest):
+def scrape_single_course_attendance(session, course_obj):
+    cid = course_obj["id"]
+    cname = course_obj["fullname"]
+    logger.info(f"Processing course: {cname} ({cid})")
+    
     try:
-        session = get_authenticated_session(creds.username, creds.password)
-    except:
-        raise HTTPException(status_code=401, detail="Login failed")
-
-    # Get sesskey and courses
-    # We must replicate logic to get correct course list
-    r = session.get(f"{MOODLE_BASE_URL}/my/") # ensures sesskey is fresh
-    soup = BeautifulSoup(r.text, "html.parser")
-    sesskey = get_sesskey(soup)
-    
-    courses = []
-    if sesskey:
-        courses = get_courses_via_ajax(session, sesskey)
-    
-    if not courses:
-        # Fallback scraping
-        seen = set()
-        for link in soup.find_all("a", href=True):
-            if "/course/view.php?id=" in link["href"]:
-                try:
-                    cid = int(link["href"].split("id=")[1].split("&")[0])
-                    if cid not in seen and cid != 1:
-                        courses.append({"id": cid, "fullname": link.get_text(strip=True)})
-                        seen.add(cid)
-                except: pass
-
-    results = []
-    total_present = 0
-    total_sessions = 0
-
-    for c in courses:
-        cid = c["id"]
-        cname = c["fullname"]
-        logger.info(f"Processing course: {cname} ({cid})")
-        
         # 1. Go to course
-        r_course = session.get(f"{MOODLE_BASE_URL}/course/view.php?id={cid}")
+        r_course = session.get(f"{MOODLE_BASE_URL}/course/view.php?id={cid}", timeout=10)
         csoup = BeautifulSoup(r_course.text, "html.parser")
         
         # 2. Find Attendance Module
         att_link = None
-        # Try finding mod/attendance/view.php link
         for l in csoup.find_all("a", href=True):
             if "mod/attendance/view.php?id=" in l["href"]:
                 att_link = l["href"]
                 break
         
         if not att_link:
-            logger.info(f" - No attendance link found")
-            results.append(CourseAttendance(course_name=cname, course_id=cid, has_attendance=False))
-            continue
+            return CourseAttendance(course_name=cname, course_id=cid, has_attendance=False)
 
         # 3. Scrape Attendance Table
         final_url = f"{att_link}&view=all" if "?" in att_link else f"{att_link}?view=all"
-        r_att = session.get(final_url)
+        r_att = session.get(final_url, timeout=10)
         asoup = BeautifulSoup(r_att.text, "html.parser")
         
         tables = asoup.find_all("table", class_="generaltable") or asoup.find_all("table")
         if not tables:
-            logger.warning(f" - Table missing on attendance page")
-            results.append(CourseAttendance(course_name=cname, course_id=cid, has_attendance=False))
-            continue
+            return CourseAttendance(course_name=cname, course_id=cid, has_attendance=False)
             
         # Locate correct table
         target = tables[0]
         for t in tables:
             headers = [th.get_text(strip=True).lower() for th in t.find_all("th")]
-            if any("status" in h for h in headers):
+            if any("status" in h for h in headers) or any("sessions" in h for h in headers):
                 target = t
                 break
         
@@ -323,41 +287,45 @@ def scrape_attendance(creds: LoginRequest):
         sessions_list = []
         rows = target.find_all("tr")
         
+        def check_status(txt):
+            txt = txt.strip().lower()
+            if not txt: return None
+            # Standard words
+            if "present" in txt: return "Present"
+            if "absent" in txt: return "Absent"
+            if "late" in txt: return "Late"
+            if "excused" in txt: return "Excused"
+            # Abbreviations (common in Moodle)
+            if txt == "p": return "Present"
+            if txt == "a": return "Absent"
+            if txt == "l": return "Late"
+            if txt == "e": return "Excused"
+            return None
+
         for row in rows:
             cells = row.find_all("td")
             if not cells: continue
             
-            # Text extraction
             row_text = row.get_text(" ", strip=True).lower()
             status_raw = "Unknown"
             
-            # Helper to check keywords
-            def check_status(txt):
-                if "present" in txt: return "Present"
-                if "absent" in txt: return "Absent"
-                if "late" in txt: return "Late"
-                if "excused" in txt: return "Excused"
-                return None
-
-            # Try column 2 or 3 specific check
-            if len(cells) >= 3:
-                sc = cells[2].get_text(strip=True).lower()
-                status_raw = check_status(sc) or status_raw
-                if status_raw == "Unknown" and len(cells) > 3:
-                    sc = cells[3].get_text(strip=True).lower()
-                    status_raw = check_status(sc) or status_raw
+            # Try specific cells (usually 3rd or 4th)
+            found_status = None
+            for cell in cells[2:5]: # Check columns 3, 4, 5
+                found_status = check_status(cell.get_text(strip=True))
+                if found_status: break
             
-            # Fallback to row text
-            if status_raw == "Unknown":
-                status_raw = check_status(row_text) or "Unknown"
-
-            if status_raw in ["Unknown", None]: continue
+            if not found_status:
+                found_status = check_status(row_text)
+            
+            if not found_status: continue
+            
+            status_raw = found_status
             
             # Parse Date logic
             date_str = ""
             try:
                 date_txt = cells[0].get_text(strip=True)
-                # Regex for "4 Feb 2026"
                 m = re.search(r"(\d{1,2}\s+\w{3}\s+\d{4})", date_txt)
                 if m:
                     dt = datetime.strptime(m.group(1), "%d %b %Y")
@@ -379,17 +347,62 @@ def scrape_attendance(creds: LoginRequest):
             # Try parsing footer %
             for r in rows:
                 if "percentage" in r.get_text(strip=True).lower():
-                    m = re.search(r"(\d+(\.\d+)?)%", r.get_text())
+                    # Look for (\d+(\.\d+)?)%
+                    m = re.search(r"(\d+(\.\d+)?)\s*%", r.get_text())
                     if m: pct = float(m.group(1))
 
-        results.append(CourseAttendance(
+        return CourseAttendance(
             course_name=cname, course_id=cid,
             present=present, absent=absent, late=late, excused=excused,
             total_sessions=total_s, percentage=pct, has_attendance=True,
             sessions=sessions_list
-        ))
-        total_present += present
-        total_sessions += total_s
+        )
+    except Exception as e:
+        logger.error(f"Error scraping course {cname}: {e}")
+        return CourseAttendance(course_name=cname, course_id=cid, has_attendance=False)
+
+@app.post("/scrape/attendance", response_model=AttendanceResponse)
+def scrape_attendance(creds: LoginRequest):
+    try:
+        session = get_authenticated_session(creds.username, creds.password)
+    except:
+        raise HTTPException(status_code=401, detail="Login failed")
+
+    # Get sesskey and courses
+    session.get(f"{MOODLE_BASE_URL}/my/") 
+    r = session.get(f"{MOODLE_BASE_URL}/my/")
+    soup = BeautifulSoup(r.text, "html.parser")
+    sesskey = get_sesskey(soup)
+    
+    courses = []
+    if sesskey:
+        courses = get_courses_via_ajax(session, sesskey)
+    
+    if not courses:
+        seen = set()
+        for link in soup.find_all("a", href=True):
+            if "/course/view.php?id=" in link["href"]:
+                try:
+                    cid = int(link["href"].split("id=")[1].split("&")[0])
+                    if cid not in seen and cid != 1:
+                        courses.append({"id": cid, "fullname": link.get_text(strip=True)})
+                        seen.add(cid)
+                except: pass
+
+    # Parallel scraping
+    results = []
+    total_present = 0
+    total_sessions = 0
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Use a list to store results in order
+        scraped_results = list(executor.map(lambda c: scrape_single_course_attendance(session, c), courses))
+
+    for res in scraped_results:
+        results.append(res)
+        if res.has_attendance:
+            total_present += res.present
+            total_sessions += res.total_sessions
 
     overall = round((total_present / total_sessions * 100) if total_sessions else 0.0, 1)
     logger.info(f"Attendance scraping done. Overall: {overall}%")
@@ -397,6 +410,7 @@ def scrape_attendance(creds: LoginRequest):
         overall_percentage=overall, total_present=total_present, 
         total_sessions=total_sessions, courses=results
     )
+
 
 
 # ════════ ASSIGNMENTS ════════
