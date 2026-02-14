@@ -3,8 +3,7 @@
  * Dashboard, Attendance Detail, Calendar, Assignments
  */
 
-const isLocal = window.location.hostname === "localhost" || window.location.hostname.startsWith("127.") || window.location.protocol === "file:";
-const API_BASE = isLocal ? "http://172.16.100.239:8000" : "";
+const API_BASE = window.location.hostname.includes("vercel.app") ? "" : "https://lms-2055kmcqy-sakki221s-projects.vercel.app";
 
 /* ═══════ STATE ═══════ */
 let credentials = null;
