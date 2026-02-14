@@ -3,7 +3,7 @@
  * Dashboard, Attendance Detail, Calendar, Assignments
  */
 
-const API_BASE = window.location.hostname.includes("vercel.app") ? "" : "https://lms-2055kmcqy-sakki221s-projects.vercel.app";
+const API_BASE = window.location.hostname.includes("vercel.app") ? "" : "https://lms-drab-chi.vercel.app";
 
 /* ═══════ STATE ═══════ */
 let credentials = null;

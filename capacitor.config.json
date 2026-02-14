@@ -1,5 +1,9 @@
 {
   "appId": "com.lmssyndicate.app",
   "appName": "Syndicate",
-  "webDir": "www"
+  "webDir": "www",
+  "server": {
+    "url": "https://lms-drab-chi.vercel.app",
+    "cleartext": true
+  }
 }
