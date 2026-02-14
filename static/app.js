@@ -3,7 +3,8 @@
  * Dashboard, Attendance Detail, Calendar, Assignments
  */
 
-const API_BASE = "http://172.16.100.239:8000";
+const isLocal = window.location.hostname === "localhost" || window.location.hostname.startsWith("127.") || window.location.protocol === "file:";
+const API_BASE = isLocal ? "http://172.16.100.239:8000" : "";
 
 /* ═══════ STATE ═══════ */
 let credentials = null;
