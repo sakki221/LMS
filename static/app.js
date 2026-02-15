@@ -3,13 +3,98 @@
  * Dashboard, Attendance Detail, Calendar, Assignments
  */
 
-const API_BASE = window.location.hostname.includes("vercel.app") ? "" : "https://lms-drab-chi.vercel.app";
+// Same-origin for web (both local and Vercel), full URL only for Capacitor/native
+const API_BASE = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" || window.location.hostname.includes("vercel.app")) ? "" : "https://lms-drab-chi.vercel.app";
 
 /* ═══════ STATE ═══════ */
 let authToken = null;
 let appData = { dashboard: null, attendance: null, assignments: null };
 let sessionMap = {};  // "YYYY-MM-DD" -> [{course, status, ...}]
 let calMonth = new Date();
+const BUNK_THRESHOLD = 0.80; // 80% attendance requirement
+
+/* ═══════ AES-GCM ENCRYPTION (Web Crypto API) ═══════ */
+const APP_PEPPER = "LMS-Pro-Syndicate-2026";
+const STORAGE_KEYS = { user: "lms_user", cred: "lms_cred", salt: "lms_salt" };
+
+async function deriveKey(username, salt) {
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+        "raw", enc.encode(username + APP_PEPPER),
+        "PBKDF2", false, ["deriveKey"]
+    );
+    return crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
+        keyMaterial,
+        { name: "AES-GCM", length: 256 },
+        false, ["encrypt", "decrypt"]
+    );
+}
+
+async function encryptAndStore(username, password) {
+    try {
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const key = await deriveKey(username, salt);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const enc = new TextEncoder();
+        const ciphertext = await crypto.subtle.encrypt(
+            { name: "AES-GCM", iv }, key, enc.encode(password)
+        );
+        // Store as base64
+        const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+        localStorage.setItem(STORAGE_KEYS.user, username);
+        localStorage.setItem(STORAGE_KEYS.salt, b64(salt));
+        localStorage.setItem(STORAGE_KEYS.cred, b64(iv) + ":" + b64(ciphertext));
+    } catch (e) {
+        console.warn("Failed to encrypt credentials:", e);
+    }
+}
+
+async function decryptStored() {
+    try {
+        const username = localStorage.getItem(STORAGE_KEYS.user);
+        const saltB64 = localStorage.getItem(STORAGE_KEYS.salt);
+        const credB64 = localStorage.getItem(STORAGE_KEYS.cred);
+        if (!username || !saltB64 || !credB64) return null;
+
+        const b64decode = (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+        const salt = b64decode(saltB64);
+        const [ivB64, ctB64] = credB64.split(":");
+        const iv = b64decode(ivB64);
+        const ciphertext = b64decode(ctB64);
+
+        const key = await deriveKey(username, salt);
+        const plainBuf = await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv }, key, ciphertext
+        );
+        const password = new TextDecoder().decode(plainBuf);
+        return { username, password };
+    } catch (e) {
+        console.warn("Failed to decrypt credentials:", e);
+        clearStoredCredentials();
+        return null;
+    }
+}
+
+function clearStoredCredentials() {
+    Object.values(STORAGE_KEYS).forEach(k => localStorage.removeItem(k));
+}
+
+/* ═══════ BUNK CALCULATOR ═══════ */
+function getBunkInfo(present, total) {
+    if (total === 0) return null;
+    const pct = present / total;
+    if (pct >= BUNK_THRESHOLD) {
+        // How many can be skipped: floor((present - threshold*total) / threshold)
+        const canSkip = Math.floor((present - BUNK_THRESHOLD * total) / BUNK_THRESHOLD);
+        if (canSkip <= 0) return { type: "perfect", text: "⚠️ Don't skip any more" };
+        return { type: "safe", text: `Can skip ${canSkip} more class${canSkip > 1 ? "es" : ""}` };
+    } else {
+        // How many must attend: ceil((threshold*total - present) / (1-threshold))
+        const mustAttend = Math.ceil((BUNK_THRESHOLD * total - present) / (1 - BUNK_THRESHOLD));
+        return { type: "danger", text: `Attend next ${mustAttend} to reach 80%` };
+    }
+}
 
 /* ═══════ HELPERS ═══════ */
 const $ = s => document.querySelector(s);
@@ -17,9 +102,17 @@ const $$ = s => document.querySelectorAll(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function authHeaders() {
+    // Token-only headers (no body)
+    const h = {};
+    if (authToken) h["Authorization"] = `Bearer ${authToken}`;
+    return h;
+}
+
+function jsonHeaders() {
+    // For requests WITH a JSON body
     return {
         "Content-Type": "application/json",
-        ...(authToken ? { "Authorization": `Bearer ${authToken}` } : {})
+        ...authHeaders()
     };
 }
 
@@ -72,68 +165,13 @@ $("#login-form").addEventListener("submit", async (e) => {
     setStep("step-login", "active");
 
     try {
-        // 1. Login — credentials sent only once
-        const loginR = await fetch(`${API_BASE}/login`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username: u, password: p })
-        });
-        const loginData = await loginR.json();
-        if (!loginR.ok) throw new Error(loginData.detail || "Login failed");
+        await performLogin(u, p);
 
-        authToken = loginData.token;
-        // Clear password from form immediately
-        $("#password").value = "";
-
-        setStep("step-login", "done");
-        setStep("step-courses", "active");
-
-        // 2. Dashboard — uses token, no body needed
-        const dr = await fetch(`${API_BASE}/scrape/dashboard`, {
-            method: "POST", headers: authHeaders()
-        });
-        const dd = await dr.json();
-        if (!dr.ok) throw new Error(typeof dd.detail === "string" ? dd.detail : "Dashboard fetch failed");
-
-        appData.dashboard = dd;
-        setStep("step-courses", "done");
-
-        // 3. Parallel: attendance + assignments — both use token
-        setStep("step-att", "active");
-        setStep("step-assign", "active");
-
-        const [attR, assR] = await Promise.allSettled([
-            fetch(`${API_BASE}/scrape/attendance`, {
-                method: "POST", headers: authHeaders()
-            }).then(r => r.json()),
-            fetch(`${API_BASE}/scrape/assignments`, {
-                method: "POST", headers: authHeaders()
-            }).then(r => r.json()),
-        ]);
-
-        if (attR.status === "fulfilled" && attR.value?.courses) {
-            appData.attendance = attR.value;
-            buildSessionMap(attR.value.courses);
-            setStep("step-att", "done");
-        } else { setStep("step-att", "done"); }
-
-        if (assR.status === "fulfilled" && assR.value?.assignments) {
-            appData.assignments = assR.value;
-            setStep("step-assign", "done");
-        } else { setStep("step-assign", "done"); }
-
-        await sleep(400);
-
-        // Build UI
-        renderDashboard();
-        renderAttendanceList();
-        renderCalendar();
-        renderAssignments();
-
-        overlay.classList.remove("active");
-        loginScreen.classList.remove("active");
-        appScreen.classList.add("active");
-        $("#user-initials").textContent = u.charAt(0).toUpperCase();
-
+        // Save encrypted credentials if "Remember Me" is checked
+        const rememberMe = $("#remember-me");
+        if (rememberMe && rememberMe.checked) {
+            await encryptAndStore(u, p);
+        }
     } catch (err) {
         overlay.classList.remove("active");
         $("#login-error").textContent = err.message || "Connection failed";
@@ -143,11 +181,89 @@ $("#login-form").addEventListener("submit", async (e) => {
     }
 });
 
+/**
+ * Core login + data fetch logic. Used by both manual login and auto-login.
+ */
+async function performLogin(u, p) {
+    // 1. Login — credentials sent only once
+    const loginR = await fetch(`${API_BASE}/login`, {
+        method: "POST", headers: jsonHeaders(),
+        body: JSON.stringify({ username: u, password: p })
+    });
+    const loginData = await loginR.json();
+    if (!loginR.ok) throw new Error(loginData.detail || "Login failed");
+
+    authToken = loginData.token;
+    // Clear password from form immediately
+    $("#password").value = "";
+
+    setStep("step-login", "done");
+    setStep("step-courses", "active");
+
+    // 2. Dashboard — uses token, no body needed
+    const dr = await fetch(`${API_BASE}/scrape/dashboard`, {
+        method: "POST", headers: authHeaders()
+    });
+    const dd = await dr.json();
+    if (!dr.ok) throw new Error(typeof dd.detail === "string" ? dd.detail : "Dashboard fetch failed");
+
+    appData.dashboard = dd;
+    setStep("step-courses", "done");
+
+    // 3. Sequential: attendance THEN assignments (shared Moodle session is not thread-safe)
+    setStep("step-att", "active");
+    try {
+        const attResp = await fetch(`${API_BASE}/scrape/attendance`, {
+            method: "POST", headers: authHeaders()
+        });
+        const attData = await attResp.json();
+        if (attResp.ok && attData?.courses) {
+            appData.attendance = attData;
+            buildSessionMap(attData.courses);
+        } else {
+            console.warn("Attendance fetch issue:", attData);
+        }
+    } catch (e) {
+        console.warn("Attendance request error:", e);
+    }
+    setStep("step-att", "done");
+
+    setStep("step-assign", "active");
+    try {
+        const assResp = await fetch(`${API_BASE}/scrape/assignments`, {
+            method: "POST", headers: authHeaders()
+        });
+        const assData = await assResp.json();
+        if (assResp.ok && assData?.assignments) {
+            appData.assignments = assData;
+        } else {
+            console.warn("Assignments fetch issue:", assData);
+        }
+    } catch (e) {
+        console.warn("Assignments request error:", e);
+    }
+    setStep("step-assign", "done");
+
+    await sleep(400);
+
+    // Build UI
+    renderDashboard();
+    renderAttendanceList();
+    renderCalendar();
+    renderAssignments();
+
+    overlay.classList.remove("active");
+    loginScreen.classList.remove("active");
+    appScreen.classList.add("active");
+    $("#user-initials").textContent = u.charAt(0).toUpperCase();
+}
+
 /* ═══════ LOGOUT ═══════ */
 $("#logout-btn").addEventListener("click", () => {
     authToken = null;
     appData = { dashboard: null, attendance: null, assignments: null };
     sessionMap = {};
+    clearStoredCredentials();
     $("#login-form").reset();
     $("#courses-grid").innerHTML = "";
     $("#att-course-list").innerHTML = "";
@@ -168,7 +284,7 @@ function renderDashboard() {
     const overall = att?.overall_percentage ?? 0;
     const statEl = $("#stat-att");
     statEl.textContent = `${overall}%`;
-    statEl.style.color = overall >= 75 ? "var(--green)" : overall >= 65 ? "var(--amber)" : "var(--red)";
+    statEl.style.color = overall >= 80 ? "var(--green)" : overall >= 70 ? "var(--amber)" : "var(--red)";
     $("#stat-pending").textContent = assigns.length;
 
     // Build attendance lookup
@@ -181,8 +297,10 @@ function renderDashboard() {
         const a = attMap[c.id];
         let attHtml = "";
         if (a && a.has_attendance && a.total_sessions > 0) {
-            const cls = a.percentage >= 75 ? "att-good" : a.percentage >= 65 ? "att-warn" : "att-bad";
-            attHtml = `<div class="cc-att"><span class="att-dot ${cls}"></span>${a.percentage}%  ·  ${a.present}P / ${a.absent}A</div>`;
+            const cls = a.percentage >= 80 ? "att-good" : a.percentage >= 70 ? "att-warn" : "att-bad";
+            const bunk = getBunkInfo(a.present, a.total_sessions);
+            const bunkTag = bunk ? ` <span class="bunk-info bunk-${bunk.type}" style="font-size:.65rem;padding:.1rem .4rem;margin-left:.3rem">${bunk.text}</span>` : "";
+            attHtml = `<div class="cc-att"><span class="att-dot ${cls}"></span>${a.percentage}%  ·  ${a.present}P / ${a.absent}A${bunkTag}</div>`;
         }
 
         const parts = c.name.split(" ");
@@ -215,13 +333,16 @@ function renderAttendanceList() {
 
     courses.forEach(c => {
         if (!c.has_attendance) return;
-        const cls = c.percentage >= 75 ? "good" : c.percentage >= 65 ? "warn" : "bad";
+        const cls = c.percentage >= 80 ? "good" : c.percentage >= 70 ? "warn" : "bad";
+        const bunk = getBunkInfo(c.present, c.total_sessions);
+        const bunkHtml = bunk ? `<div class="bunk-info bunk-${bunk.type}">${bunk.text}</div>` : "";
         const row = document.createElement("div");
         row.className = "att-row";
         row.innerHTML = `
             <div class="att-info">
                 <div class="att-name">${c.course_name}</div>
                 <div class="att-meta">${c.present}P · ${c.absent}A · ${c.late}L — ${c.total_sessions} sessions</div>
+                ${bunkHtml}
             </div>
             <span class="att-pct ${cls}">${c.percentage}%</span>
             <span class="att-arrow">
@@ -238,7 +359,7 @@ function openCourseDetail(course) {
     const detail = $("#course-detail");
     detail.style.display = "block";
 
-    const cls = course.percentage >= 75 ? "var(--green)" : course.percentage >= 65 ? "var(--amber)" : "var(--red)";
+    const cls = course.percentage >= 80 ? "var(--green)" : course.percentage >= 70 ? "var(--amber)" : "var(--red)";
 
     $("#detail-header").innerHTML = `
         <div class="dh-name">${course.course_name}</div>
@@ -417,3 +538,37 @@ function renderAssignments() {
         list.appendChild(card);
     });
 }
+
+/* ═══════ AUTO-LOGIN ON PAGE LOAD ═══════ */
+(async function autoLogin() {
+    const stored = await decryptStored();
+    if (!stored) return; // No saved credentials, show login screen normally
+
+    // Show auto-login overlay
+    const autoOverlay = document.createElement("div");
+    autoOverlay.className = "auto-login-overlay";
+    autoOverlay.innerHTML = `
+        <div class="loading-ring"></div>
+        <p>Signing you in...</p>
+    `;
+    document.body.appendChild(autoOverlay);
+
+    // Also activate the step overlay for progress
+    const overlay = $("#loading-overlay");
+    overlay.classList.add("active");
+    setStep("step-login", "active");
+
+    try {
+        await performLogin(stored.username, stored.password);
+        // Re-encrypt to rotate salt/IV (defense in depth)
+        await encryptAndStore(stored.username, stored.password);
+    } catch (e) {
+        console.warn("Auto-login failed:", e.message);
+        clearStoredCredentials();
+        overlay.classList.remove("active");
+        // Show login screen normally
+        loginScreen.classList.add("active");
+    } finally {
+        autoOverlay.remove();
+    }
+})();

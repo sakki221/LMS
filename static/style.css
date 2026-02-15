@@ -968,6 +968,98 @@ body {
 }
 
 
+/* ══════════ REMEMBER ME ══════════ */
+.remember-field {
+    margin-top: -0.4rem;
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    font-size: 0.82rem;
+    color: var(--text2);
+    user-select: none;
+}
+
+.checkbox-label input[type="checkbox"] {
+    display: none;
+}
+
+.checkmark {
+    width: 16px;
+    height: 16px;
+    border: 1.5px solid #555;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: 0.2s;
+    flex-shrink: 0;
+}
+
+.checkbox-label input:checked~.checkmark {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+.checkbox-label input:checked~.checkmark::after {
+    content: '✓';
+    color: #000;
+    font-size: 11px;
+    font-weight: 800;
+}
+
+/* ══════════ BUNK CALCULATOR ══════════ */
+.bunk-info {
+    margin-top: 0.4rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.25rem 0.6rem;
+    border-radius: 4px;
+    display: inline-block;
+    letter-spacing: 0.02em;
+}
+
+.bunk-safe {
+    background: rgba(39, 174, 96, 0.12);
+    color: var(--green);
+}
+
+.bunk-danger {
+    background: rgba(192, 57, 43, 0.12);
+    color: var(--red);
+}
+
+.bunk-perfect {
+    background: rgba(212, 175, 55, 0.12);
+    color: var(--accent);
+}
+
+/* ══════════ AUTO-LOGIN OVERLAY ══════════ */
+.auto-login-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: var(--black);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+}
+
+.auto-login-overlay .loading-ring {
+    width: 36px;
+    height: 36px;
+}
+
+.auto-login-overlay p {
+    color: var(--text3);
+    font-size: 0.85rem;
+}
+
 /* ══════════ RESPONSIVE ══════════ */
 @media (min-width:768px) {
 

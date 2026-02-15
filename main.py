@@ -19,6 +19,7 @@ import os
 import logging
 import secrets
 import uuid
+import threading
 from datetime import datetime
 from bs4 import BeautifulSoup
 from typing import Optional, List
@@ -228,6 +229,9 @@ AUTH_TOKENS = {}    # {token: {"username": str, "password": str, "expiry": ts}}
 SESSION_TIMEOUT = 300  # 5 minutes
 TOKEN_TIMEOUT = 1800   # 30 minutes
 
+# Thread-safe lock for session management
+_session_lock = threading.Lock()
+
 def generate_token():
     """Generate a secure random token."""
     return secrets.token_urlsafe(32)
@@ -245,6 +249,10 @@ def validate_token(token: str):
     return entry["username"], entry["password"]
 
 def get_authenticated_session(username, password):
+    with _session_lock:
+        return _get_authenticated_session_inner(username, password)
+
+def _get_authenticated_session_inner(username, password):
     now = time.time()
     existing = USER_SESSIONS.get(username)
     
@@ -553,10 +561,8 @@ def scrape_attendance(creds: Optional[LoginRequest] = Body(default=None), author
     total_present = 0
     total_sessions = 0
 
-    # max_workers=2 is safer for session stability on some Moodle configs
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        # Pass the session directly
-        scraped_results = list(executor.map(lambda c: scrape_single_course_attendance(session, c), courses))
+    # Sequential scraping (session is not thread-safe with Moodle cookies)
+    scraped_results = [scrape_single_course_attendance(session, c) for c in courses]
 
     for res in scraped_results:
         results.append(res)
