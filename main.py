@@ -7,30 +7,29 @@ and exposes scraped data (dashboard, attendance) as JSON endpoints.
 Target: https://lmsug24.iiitkottayam.ac.in
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import requests
 import re
-import json
 import time
 import os
 import logging
+import secrets
+import uuid
 from datetime import datetime
 from bs4 import BeautifulSoup
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
 
 # ════════ LOGGING SETUP ════════
-# ════════ LOGGING SETUP ════════
 # Use stdout for Vercel compatibility
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
 logger = logging.getLogger(__name__)
 
 # ════════ CONFIGURATION ════════
@@ -39,9 +38,15 @@ LOGIN_URL = f"{MOODLE_BASE_URL}/login/index.php"
 
 app = FastAPI()
 
+ALLOWED_ORIGINS = [
+    "https://lms-drab-chi.vercel.app",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -96,6 +101,15 @@ class Assignment(BaseModel):
 
 class AssignmentsResponse(BaseModel):
     assignments: list[Assignment]
+
+class LoginResponse(BaseModel):
+    success: bool
+    token: str
+    user_name: Optional[str] = None
+    message: Optional[str] = None
+
+class TokenRequest(BaseModel):
+    token: str
 
 # ════════ HELPERS ════════
 def safe_request(method, url, session=None, retries=2, backoff=1, **kwargs):
@@ -208,9 +222,27 @@ def get_courses_via_ajax(session, sesskey):
 
 # ════════ ROUTES ════════
 
-# ════════ SESSION MANAGEMENT ════════
+# ════════ SESSION & TOKEN MANAGEMENT ════════
 USER_SESSIONS = {}  # {username: {"session": s, "expiry": ts}}
+AUTH_TOKENS = {}    # {token: {"username": str, "password": str, "expiry": ts}}
 SESSION_TIMEOUT = 300  # 5 minutes
+TOKEN_TIMEOUT = 1800   # 30 minutes
+
+def generate_token():
+    """Generate a secure random token."""
+    return secrets.token_urlsafe(32)
+
+def validate_token(token: str):
+    """Validate a token and return (username, password) or raise 401."""
+    entry = AUTH_TOKENS.get(token)
+    if not entry:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if time.time() > entry["expiry"]:
+        del AUTH_TOKENS[token]
+        raise HTTPException(status_code=401, detail="Token expired, please login again")
+    # Extend token expiry on use
+    AUTH_TOKENS[token]["expiry"] = time.time() + TOKEN_TIMEOUT
+    return entry["username"], entry["password"]
 
 def get_authenticated_session(username, password):
     now = time.time()
@@ -259,15 +291,51 @@ def get_authenticated_session(username, password):
 
 # ════════ ROUTES ════════
 
+@app.post("/login", response_model=LoginResponse)
+def login(creds: LoginRequest):
+    """Authenticate and return a session token. Credentials are only sent once."""
+    try:
+        session = get_authenticated_session(creds.username, creds.password)
+        r = safe_request("GET", f"{MOODLE_BASE_URL}/my/", session=session)
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        user_name = "Student"
+        u_text = soup.find("div", class_="usermenu") or soup.find("span", class_="usertext")
+        if u_text: user_name = u_text.get_text(strip=True)
+        
+        token = generate_token()
+        AUTH_TOKENS[token] = {
+            "username": creds.username,
+            "password": creds.password,
+            "expiry": time.time() + TOKEN_TIMEOUT
+        }
+        logger.info(f"Token issued for {creds.username}")
+        return LoginResponse(success=True, token=token, user_name=user_name)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
+
 @app.get("/")
 def read_root():
+    """Serve the frontend."""
     if os.path.exists("index.html"): return FileResponse("index.html")
     return {"message": "Backend Running"}
 
+
 @app.post("/scrape/dashboard", response_model=DashboardResponse)
-def scrape_dashboard(creds: LoginRequest):
+def scrape_dashboard(creds: LoginRequest = None, authorization: Optional[str] = Header(None)):
+    # Support both token-based and legacy credential-based auth
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+        username, password = validate_token(token)
+    elif creds:
+        username, password = creds.username, creds.password
+    else:
+        raise HTTPException(status_code=401, detail="No credentials provided")
+
     try:
-        session = get_authenticated_session(creds.username, creds.password)
+        session = get_authenticated_session(username, password)
         r = safe_request("GET", f"{MOODLE_BASE_URL}/my/", session=session)
     except HTTPException as e:
         raise e
@@ -286,7 +354,7 @@ def scrape_dashboard(creds: LoginRequest):
     # Scrape courses
     courses_data = []
     if sesskey:
-        logger.info(f"Sesskey found: {sesskey}, trying AJAX scraping")
+        logger.info(f"Sesskey found: {sesskey[:4]}****, trying AJAX scraping")
         raw_courses = get_courses_via_ajax(session, sesskey)
         for c in raw_courses:
             courses_data.append(CourseInfo(id=c['id'], name=c['fullname'], shortname=c['shortname'], url=c['url']))
@@ -440,9 +508,18 @@ def scrape_single_course_attendance(session, course_obj):
         return CourseAttendance(course_name=cname, course_id=cid, has_attendance=False)
 
 @app.post("/scrape/attendance", response_model=AttendanceResponse)
-def scrape_attendance(creds: LoginRequest):
+def scrape_attendance(creds: LoginRequest = None, authorization: Optional[str] = Header(None)):
+    # Support both token-based and legacy credential-based auth
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+        username, password = validate_token(token)
+    elif creds:
+        username, password = creds.username, creds.password
+    else:
+        raise HTTPException(status_code=401, detail="No credentials provided")
+
     try:
-        session = get_authenticated_session(creds.username, creds.password)
+        session = get_authenticated_session(username, password)
     except:
         raise HTTPException(status_code=401, detail="Login failed")
 
@@ -536,9 +613,18 @@ def get_assignments_via_ajax(session, sesskey):
     return assigns
 
 @app.post("/scrape/assignments", response_model=AssignmentsResponse)
-def scrape_assignments(creds: LoginRequest):
+def scrape_assignments(creds: LoginRequest = None, authorization: Optional[str] = Header(None)):
+    # Support both token-based and legacy credential-based auth
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+        username, password = validate_token(token)
+    elif creds:
+        username, password = creds.username, creds.password
+    else:
+        return AssignmentsResponse(assignments=[])
+
     try:
-        session = get_authenticated_session(creds.username, creds.password)
+        session = get_authenticated_session(username, password)
     except:
         return AssignmentsResponse(assignments=[])
         

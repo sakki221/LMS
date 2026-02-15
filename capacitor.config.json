@@ -4,6 +4,6 @@
   "webDir": "www",
   "server": {
     "url": "https://lms-drab-chi.vercel.app",
-    "cleartext": true
+    "cleartext": false
   }
 }

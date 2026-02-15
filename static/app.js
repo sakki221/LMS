@@ -6,7 +6,7 @@
 const API_BASE = window.location.hostname.includes("vercel.app") ? "" : "https://lms-drab-chi.vercel.app";
 
 /* ═══════ STATE ═══════ */
-let credentials = null;
+let authToken = null;
 let appData = { dashboard: null, attendance: null, assignments: null };
 let sessionMap = {};  // "YYYY-MM-DD" -> [{course, status, ...}]
 let calMonth = new Date();
@@ -15,6 +15,13 @@ let calMonth = new Date();
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function authHeaders() {
+    return {
+        "Content-Type": "application/json",
+        ...(authToken ? { "Authorization": `Bearer ${authToken}` } : {})
+    };
+}
 
 function toast(msg, type = "info") {
     const t = document.createElement("div");
@@ -65,31 +72,44 @@ $("#login-form").addEventListener("submit", async (e) => {
     setStep("step-login", "active");
 
     try {
-        // 1. Dashboard
-        const dr = await fetch(`${API_BASE}/scrape/dashboard`, {
+        // 1. Login — credentials sent only once
+        const loginR = await fetch(`${API_BASE}/login`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ username: u, password: p })
         });
-        const dd = await dr.json();
-        if (!dr.ok) throw new Error(dd.detail || "Login failed");
+        const loginData = await loginR.json();
+        if (!loginR.ok) throw new Error(loginData.detail || "Login failed");
 
-        credentials = { username: u, password: p };
-        appData.dashboard = dd;
+        authToken = loginData.token;
+        // Clear password from form immediately
+        $("#password").value = "";
+
         setStep("step-login", "done");
+        setStep("step-courses", "active");
+
+        // 2. Dashboard — uses token
+        const dr = await fetch(`${API_BASE}/scrape/dashboard`, {
+            method: "POST", headers: authHeaders(),
+            body: JSON.stringify({})
+        });
+        const dd = await dr.json();
+        if (!dr.ok) throw new Error(dd.detail || "Dashboard fetch failed");
+
+        appData.dashboard = dd;
         setStep("step-courses", "done");
 
-        // 2. Parallel: attendance + assignments
+        // 3. Parallel: attendance + assignments — both use token
         setStep("step-att", "active");
         setStep("step-assign", "active");
 
         const [attR, assR] = await Promise.allSettled([
             fetch(`${API_BASE}/scrape/attendance`, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(credentials)
+                method: "POST", headers: authHeaders(),
+                body: JSON.stringify({})
             }).then(r => r.json()),
             fetch(`${API_BASE}/scrape/assignments`, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(credentials)
+                method: "POST", headers: authHeaders(),
+                body: JSON.stringify({})
             }).then(r => r.json()),
         ]);
 
@@ -120,6 +140,7 @@ $("#login-form").addEventListener("submit", async (e) => {
     } catch (err) {
         overlay.classList.remove("active");
         $("#login-error").textContent = err.message || "Connection failed";
+        authToken = null;
     } finally {
         btn.classList.remove("loading");
     }
@@ -127,7 +148,7 @@ $("#login-form").addEventListener("submit", async (e) => {
 
 /* ═══════ LOGOUT ═══════ */
 $("#logout-btn").addEventListener("click", () => {
-    credentials = null;
+    authToken = null;
     appData = { dashboard: null, attendance: null, assignments: null };
     sessionMap = {};
     $("#login-form").reset();
