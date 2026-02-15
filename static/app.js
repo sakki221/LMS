@@ -200,51 +200,34 @@ async function performLogin(u, p) {
     setStep("step-login", "done");
     setStep("step-courses", "active");
 
-    // 2. Dashboard — uses token, no body needed
-    const dr = await fetch(`${API_BASE}/scrape/dashboard`, {
+    // 2. Single combined fetch — dashboard + attendance + assignments in one call
+    const allR = await fetch(`${API_BASE}/scrape/all`, {
         method: "POST", headers: authHeaders()
     });
-    const dd = await dr.json();
-    if (!dr.ok) throw new Error(typeof dd.detail === "string" ? dd.detail : "Dashboard fetch failed");
 
-    appData.dashboard = dd;
+    // Animate steps while we parse
     setStep("step-courses", "done");
-
-    // 3. Sequential: attendance THEN assignments (shared Moodle session is not thread-safe)
     setStep("step-att", "active");
-    try {
-        const attResp = await fetch(`${API_BASE}/scrape/attendance`, {
-            method: "POST", headers: authHeaders()
-        });
-        const attData = await attResp.json();
-        if (attResp.ok && attData?.courses) {
-            appData.attendance = attData;
-            buildSessionMap(attData.courses);
-        } else {
-            console.warn("Attendance fetch issue:", attData);
-        }
-    } catch (e) {
-        console.warn("Attendance request error:", e);
+    setStep("step-assign", "active");
+
+    const allData = await allR.json();
+    if (!allR.ok) throw new Error(typeof allData.detail === "string" ? allData.detail : "Data fetch failed");
+
+    // Unpack combined response
+    appData.dashboard = { success: true, courses: allData.courses, user_name: allData.user_name };
+
+    if (allData.attendance?.courses) {
+        appData.attendance = allData.attendance;
+        buildSessionMap(allData.attendance.courses);
     }
     setStep("step-att", "done");
 
-    setStep("step-assign", "active");
-    try {
-        const assResp = await fetch(`${API_BASE}/scrape/assignments`, {
-            method: "POST", headers: authHeaders()
-        });
-        const assData = await assResp.json();
-        if (assResp.ok && assData?.assignments) {
-            appData.assignments = assData;
-        } else {
-            console.warn("Assignments fetch issue:", assData);
-        }
-    } catch (e) {
-        console.warn("Assignments request error:", e);
+    if (allData.assignments) {
+        appData.assignments = { assignments: allData.assignments };
     }
     setStep("step-assign", "done");
 
-    await sleep(400);
+    await sleep(300);
 
     // Build UI
     renderDashboard();
@@ -255,7 +238,7 @@ async function performLogin(u, p) {
     overlay.classList.remove("active");
     loginScreen.classList.remove("active");
     appScreen.classList.add("active");
-    $("#user-initials").textContent = u.charAt(0).toUpperCase();
+    $("#user-initials").textContent = (allData.user_name || u).charAt(0).toUpperCase();
 }
 
 /* ═══════ LOGOUT ═══════ */

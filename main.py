@@ -103,6 +103,14 @@ class Assignment(BaseModel):
 class AssignmentsResponse(BaseModel):
     assignments: list[Assignment]
 
+class AllDataResponse(BaseModel):
+    """Combined response for /scrape/all — single round-trip for everything."""
+    success: bool
+    user_name: Optional[str] = None
+    courses: list[CourseInfo] = []
+    attendance: Optional[AttendanceResponse] = None
+    assignments: list[Assignment] = []
+
 class LoginResponse(BaseModel):
     success: bool
     token: str
@@ -224,7 +232,7 @@ def get_courses_via_ajax(session, sesskey):
 # ════════ ROUTES ════════
 
 # ════════ SESSION & TOKEN MANAGEMENT ════════
-USER_SESSIONS = {}  # {username: {"session": s, "expiry": ts}}
+USER_SESSIONS = {}  # {username: {"session": s, "expiry": ts, "last_used": ts}}
 AUTH_TOKENS = {}    # {token: {"username": str, "password": str, "expiry": ts}}
 SESSION_TIMEOUT = 300  # 5 minutes
 TOKEN_TIMEOUT = 1800   # 30 minutes
@@ -259,22 +267,27 @@ def _get_authenticated_session_inner(username, password):
     if existing:
         s = existing["session"]
         expires = existing["expiry"]
+        last_used = existing.get("last_used", 0)
         if now < expires:
-            # Basic check to see if we're still logged in
+            # Skip validation if used within last 60s (avoids redundant GET /my/)
+            if now - last_used < 60:
+                logger.info(f"Reusing fresh session for {username} (skipped validation)")
+                USER_SESSIONS[username]["expiry"] = now + SESSION_TIMEOUT
+                USER_SESSIONS[username]["last_used"] = now
+                return s
+            # Otherwise validate
             try:
                 r = s.get(f"{MOODLE_BASE_URL}/my/", allow_redirects=False, timeout=5)
                 if r.status_code == 200:
                     logger.info(f"Reusing existing session for {username}")
-                    # Extend expiry
                     USER_SESSIONS[username]["expiry"] = now + SESSION_TIMEOUT
+                    USER_SESSIONS[username]["last_used"] = now
                     return s
             except: pass
 
     # Create new session
     logger.info(f"Creating new session for {username}")
     s = requests.Session()
-    # Disable SSL verification if needed, but Moodle usually has valid certs
-    # s.verify = False 
     try:
         r = safe_request("GET", LOGIN_URL, session=s, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -286,12 +299,12 @@ def _get_authenticated_session_inner(username, password):
         r = safe_request("POST", LOGIN_URL, session=s, data={"username": username, "password": password, "logintoken": token}, timeout=10)
         
         # Check if we are actually logged in
-        if "login/index.php" in r.url and "Force change" not in r.text: # Ignore 'force change password' as log in
+        if "login/index.php" in r.url and "Force change" not in r.text:
             if "Invalid login" in r.text or soup.find("span", class_="error"):
                 raise Exception("Invalid credentials")
             raise Exception("Login failed - still on login page")
             
-        USER_SESSIONS[username] = {"session": s, "expiry": now + SESSION_TIMEOUT}
+        USER_SESSIONS[username] = {"session": s, "expiry": now + SESSION_TIMEOUT, "last_used": now}
         return s
     except Exception as e:
         logger.error(f"Login error for {username}: {e}")
@@ -383,7 +396,17 @@ def scrape_dashboard(creds: Optional[LoginRequest] = Body(default=None), authori
     logger.info(f"Final course count: {len(courses_data)}")
     return DashboardResponse(success=True, user_name=user_name, courses=courses_data)
 
-def scrape_single_course_attendance(session, course_obj):
+def scrape_single_course_attendance(session_or_cookies, course_obj):
+    """Scrape attendance for a single course.
+    session_or_cookies: either a requests.Session or a dict of cookies (for parallel mode).
+    """
+    if isinstance(session_or_cookies, dict):
+        # Create an independent session with cloned cookies (thread-safe)
+        session = requests.Session()
+        session.cookies.update(session_or_cookies)
+    else:
+        session = session_or_cookies
+
     cid = course_obj["id"] if isinstance(course_obj, dict) else course_obj.id
     cname = course_obj["fullname"] if isinstance(course_obj, dict) else course_obj.name
     logger.info(f"Processing course: {cname} ({cid})")
@@ -561,8 +584,10 @@ def scrape_attendance(creds: Optional[LoginRequest] = Body(default=None), author
     total_present = 0
     total_sessions = 0
 
-    # Sequential scraping (session is not thread-safe with Moodle cookies)
-    scraped_results = [scrape_single_course_attendance(session, c) for c in courses]
+    # Parallel scraping with cloned cookies (each thread gets its own session)
+    cookies = dict(session.cookies)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        scraped_results = list(executor.map(lambda c: scrape_single_course_attendance(cookies, c), courses))
 
     for res in scraped_results:
         results.append(res)
@@ -645,6 +670,92 @@ def scrape_assignments(creds: Optional[LoginRequest] = Body(default=None), autho
         logger.info(f"Scraped {len(assigns)} pending assignments via AJAX")
         
     return AssignmentsResponse(assignments=assigns)
+
+# ════════ COMBINED ENDPOINT (OPTIMIZED) ════════
+@app.post("/scrape/all", response_model=AllDataResponse)
+def scrape_all(creds: Optional[LoginRequest] = Body(default=None), authorization: Optional[str] = Header(None)):
+    """Single endpoint that returns dashboard + attendance + assignments.
+    Eliminates redundant /my/ fetches and sesskey extractions."""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+        username, password = validate_token(token)
+    elif creds:
+        username, password = creds.username, creds.password
+    else:
+        raise HTTPException(status_code=401, detail="No credentials provided")
+
+    try:
+        session = get_authenticated_session(username, password)
+    except HTTPException as e:
+        raise e
+    except Exception:
+        raise HTTPException(status_code=500, detail="Session error")
+
+    # ── Single /my/ fetch (replaces 4 separate ones) ──
+    r = safe_request("GET", f"{MOODLE_BASE_URL}/my/", session=session)
+    soup = BeautifulSoup(r.text, "html.parser")
+    sesskey = get_sesskey(soup)
+
+    user_name = "Student"
+    u_text = soup.find("div", class_="usermenu") or soup.find("span", class_="usertext")
+    if u_text: user_name = u_text.get_text(strip=True)
+
+    # ── Courses (single AJAX call, reused for dashboard + attendance) ──
+    raw_courses = []
+    if sesskey:
+        logger.info(f"Sesskey found: {sesskey[:4]}****, fetching courses")
+        raw_courses = get_courses_via_ajax(session, sesskey)
+
+    courses_data = []
+    for c in raw_courses:
+        courses_data.append(CourseInfo(id=c['id'], name=c['fullname'], shortname=c['shortname'], url=c['url']))
+
+    # Fallback to link scraping
+    if not courses_data:
+        logger.warning("AJAX returned 0 courses, falling back to link scraping")
+        seen = set()
+        for link in soup.find_all("a", href=True):
+            if "/course/view.php?id=" in link["href"]:
+                try:
+                    cid = int(link["href"].split("id=")[1].split("&")[0])
+                    if cid not in seen and cid != 1:
+                        courses_data.append(CourseInfo(id=cid, name=link.get_text(strip=True), shortname="", url=link["href"]))
+                        seen.add(cid)
+                except: pass
+
+    # ── Attendance (parallel with cloned cookies) ──
+    att_response = None
+    if raw_courses or courses_data:
+        course_list = raw_courses if raw_courses else [{"id": c.id, "fullname": c.name} for c in courses_data]
+        cookies = dict(session.cookies)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            scraped_results = list(executor.map(
+                lambda c: scrape_single_course_attendance(cookies, c), course_list
+            ))
+
+        total_present = sum(r.present for r in scraped_results if r.has_attendance)
+        total_sessions = sum(r.total_sessions for r in scraped_results if r.has_attendance)
+        overall = round((total_present / total_sessions * 100) if total_sessions else 0.0, 1)
+        att_response = AttendanceResponse(
+            overall_percentage=overall, total_present=total_present,
+            total_sessions=total_sessions, courses=scraped_results
+        )
+        logger.info(f"Attendance done: {len(scraped_results)} courses, {overall}%")
+
+    # ── Assignments (reuse same sesskey, no extra /my/ fetch) ──
+    assigns = []
+    if sesskey:
+        assigns = get_assignments_via_ajax(session, sesskey)
+        logger.info(f"Scraped {len(assigns)} pending assignments")
+
+    logger.info(f"Combined scrape complete: {len(courses_data)} courses")
+    return AllDataResponse(
+        success=True,
+        user_name=user_name,
+        courses=courses_data,
+        attendance=att_response,
+        assignments=assigns
+    )
 
 # Mount static last to avoid overwriting API routes
 try:
