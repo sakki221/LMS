@@ -98,6 +98,25 @@ class AssignmentsResponse(BaseModel):
     assignments: list[Assignment]
 
 # ════════ HELPERS ════════
+def safe_request(method, url, session=None, retries=2, backoff=1, **kwargs):
+    """
+    Wrapper for requests with retry logic and basic error handling.
+    """
+    caller = session if session else requests
+    for i in range(retries + 1):
+        try:
+            r = caller.request(method, url, **kwargs)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            if i < retries:
+                wait = backoff * (2 ** i)
+                logger.warning(f"Request failed: {url}. Retrying in {wait}s... (Attempt {i+1}/{retries})")
+                time.sleep(wait)
+            else:
+                logger.error(f"Final request failure for {url}: {e}")
+                raise
+
 def get_sesskey(soup):
     # Method 1: M.cfg.sesskey in scripts
     try:
@@ -114,11 +133,20 @@ def get_sesskey(soup):
         logout_link = soup.find("a", href=True, string=re.compile(r"Log\s*out", re.I))
         if logout_link and "sesskey=" in logout_link["href"]:
             return logout_link["href"].split("sesskey=")[1].split("&")[0]
-            
-        # Method 3: Any link with sesskey
+    except: pass
+
+    # Method 3: Any link with sesskey
+    try:
         for a in soup.find_all("a", href=True):
             if "sesskey=" in a["href"]:
                  return a["href"].split("sesskey=")[1].split("&")[0]
+    except: pass
+
+    # Method 4: Hidden input fields
+    try:
+        sesskey_input = soup.find("input", {"name": "sesskey"})
+        if sesskey_input:
+            return sesskey_input["value"]
     except: pass
     
     logger.warning("Failed to extract sesskey from page")
@@ -143,7 +171,7 @@ def get_courses_via_ajax(session, sesskey):
     
     courses = []
     try:
-        r = session.post(url, json=payload, timeout=10)
+        r = safe_request("POST", url, session=session, json=payload, timeout=10)
         data = r.json()
         if data and not data[0].get("error"):
             raw_courses = data[0]['data']['courses']
@@ -154,12 +182,28 @@ def get_courses_via_ajax(session, sesskey):
                     "shortname": rc.get('shortname', rc['fullname']),
                     "url": rc['viewurl']
                 })
-        else:
-            logger.warning(f"AJAX courses failed or empty: {data}")
+        
+        # Fallback if "inprogress" is empty - check "all"
+        if not courses:
+            logger.info("No 'inprogress' courses, checking 'all' classification")
+            payload[0]["args"]["classification"] = "all"
+            r = safe_request("POST", url, session=session, json=payload, timeout=10)
+            data = r.json()
+            if data and not data[0].get("error"):
+                raw_courses = data[0]['data']['courses']
+                for rc in raw_courses:
+                    # Skip 'Site home' or similar if necessary, usually id=1
+                    if rc['id'] == 1: continue
+                    courses.append({
+                        "id": rc['id'], 
+                        "fullname": rc['fullname'], 
+                        "shortname": rc.get('shortname', rc['fullname']),
+                        "url": rc['viewurl']
+                    })
+
     except Exception as e:
         logger.error(f"AJAX scraping exception: {e}")
     
-    # Fallback: site home or scraping links if AJAX fails
     return courses
 
 # ════════ ROUTES ════════
@@ -174,13 +218,17 @@ def get_authenticated_session(username, password):
     
     if existing:
         s = existing["session"]
-        # Basic check to see if we're still logged in
-        try:
-            r = s.get(f"{MOODLE_BASE_URL}/my/", allow_redirects=False, timeout=5)
-            if r.status_code == 200:
-                logger.info(f"Reusing existing session for {username}")
-                return s
-        except: pass
+        expires = existing["expiry"]
+        if now < expires:
+            # Basic check to see if we're still logged in
+            try:
+                r = s.get(f"{MOODLE_BASE_URL}/my/", allow_redirects=False, timeout=5)
+                if r.status_code == 200:
+                    logger.info(f"Reusing existing session for {username}")
+                    # Extend expiry
+                    USER_SESSIONS[username]["expiry"] = now + SESSION_TIMEOUT
+                    return s
+            except: pass
 
     # Create new session
     logger.info(f"Creating new session for {username}")
@@ -188,19 +236,20 @@ def get_authenticated_session(username, password):
     # Disable SSL verification if needed, but Moodle usually has valid certs
     # s.verify = False 
     try:
-        r = s.get(LOGIN_URL, timeout=10)
+        r = safe_request("GET", LOGIN_URL, session=s, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         token_el = soup.find("input", {"name": "logintoken"})
         if not token_el:
             raise Exception("Login token not found")
         token = token_el["value"]
         
-        r = s.post(LOGIN_URL, data={"username": username, "password": password, "logintoken": token}, timeout=10)
+        r = safe_request("POST", LOGIN_URL, session=s, data={"username": username, "password": password, "logintoken": token}, timeout=10)
+        
+        # Check if we are actually logged in
         if "login/index.php" in r.url and "Force change" not in r.text: # Ignore 'force change password' as log in
-            if soup.find("span", class_="error"):
-                e_msg = soup.find("span", class_="error").get_text()
-                raise Exception(f"Moodle error: {e_msg}")
-            raise Exception("Invalid credentials - still on login page")
+            if "Invalid login" in r.text or soup.find("span", class_="error"):
+                raise Exception("Invalid credentials")
+            raise Exception("Login failed - still on login page")
             
         USER_SESSIONS[username] = {"session": s, "expiry": now + SESSION_TIMEOUT}
         return s
@@ -219,7 +268,7 @@ def read_root():
 def scrape_dashboard(creds: LoginRequest):
     try:
         session = get_authenticated_session(creds.username, creds.password)
-        r = session.get(f"{MOODLE_BASE_URL}/my/")
+        r = safe_request("GET", f"{MOODLE_BASE_URL}/my/", session=session)
     except HTTPException as e:
         raise e
     except Exception:
@@ -259,13 +308,13 @@ def scrape_dashboard(creds: LoginRequest):
     return DashboardResponse(success=True, user_name=user_name, courses=courses_data)
 
 def scrape_single_course_attendance(session, course_obj):
-    cid = course_obj["id"]
-    cname = course_obj["fullname"]
+    cid = course_obj["id"] if isinstance(course_obj, dict) else course_obj.id
+    cname = course_obj["fullname"] if isinstance(course_obj, dict) else course_obj.name
     logger.info(f"Processing course: {cname} ({cid})")
     
     try:
         # 1. Go to course
-        r_course = session.get(f"{MOODLE_BASE_URL}/course/view.php?id={cid}", timeout=10)
+        r_course = safe_request("GET", f"{MOODLE_BASE_URL}/course/view.php?id={cid}", session=session, timeout=10)
         csoup = BeautifulSoup(r_course.text, "html.parser")
         
         # 2. Find Attendance Module
@@ -276,25 +325,32 @@ def scrape_single_course_attendance(session, course_obj):
                 break
         
         if not att_link:
+            logger.info(f"No attendance module found for {cname}")
             return CourseAttendance(course_name=cname, course_id=cid, has_attendance=False)
 
         # 3. Scrape Attendance Table
         final_url = f"{att_link}&view=all" if "?" in att_link else f"{att_link}?view=all"
-        r_att = session.get(final_url, timeout=10)
+        r_att = safe_request("GET", final_url, session=session, timeout=10)
         asoup = BeautifulSoup(r_att.text, "html.parser")
         
         tables = asoup.find_all("table", class_="generaltable") or asoup.find_all("table")
         if not tables:
+            logger.warning(f"No attendance table found for {cname} at {final_url}")
             return CourseAttendance(course_name=cname, course_id=cid, has_attendance=False)
             
         # Locate correct table
         target = tables[0]
+        found_table = False
         for t in tables:
             headers = [th.get_text(strip=True).lower() for th in t.find_all("th")]
             if any("status" in h for h in headers) or any("sessions" in h for h in headers):
                 target = t
+                found_table = True
                 break
         
+        if not found_table:
+             logger.warning(f"Could not identify attendance table among {len(tables)} tables for {cname}")
+
         # Parse rows
         present = absent = late = excused = 0
         sessions_list = []
@@ -339,10 +395,19 @@ def scrape_single_course_attendance(session, course_obj):
             date_str = ""
             try:
                 date_txt = cells[0].get_text(strip=True)
+                # Try multiple formats
+                # 1. "Wed 4 Feb 2026"
                 m = re.search(r"(\d{1,2}\s+\w{3}\s+\d{4})", date_txt)
                 if m:
                     dt = datetime.strptime(m.group(1), "%d %b %Y")
                     date_str = dt.strftime("%Y-%m-%d")
+                else:
+                    # 2. "04.02.26" or similar
+                    m2 = re.search(r"(\d{2})[./](\d{2})[./](\d{2,4})", date_txt)
+                    if m2:
+                        y = m2.group(3)
+                        if len(y) == 2: y = "20" + y
+                        date_str = f"{y}-{m2.group(2)}-{m2.group(1)}"
             except: pass
             
             sessions_list.append(Session(date=date_str, status=status_raw, points=""))
@@ -357,7 +422,7 @@ def scrape_single_course_attendance(session, course_obj):
         pct = 0.0
         if total_s > 0:
             pct = round((present / total_s) * 100, 1)
-            # Try parsing footer %
+            # Try parsing footer % if available
             for r in rows:
                 if "percentage" in r.get_text(strip=True).lower():
                     # Look for (\d+(\.\d+)?)%
@@ -381,9 +446,8 @@ def scrape_attendance(creds: LoginRequest):
     except:
         raise HTTPException(status_code=401, detail="Login failed")
 
-    # Get sesskey and courses
-    session.get(f"{MOODLE_BASE_URL}/my/") 
-    r = session.get(f"{MOODLE_BASE_URL}/my/")
+    # Ensure we are on a page where sesskey exists
+    r = safe_request("GET", f"{MOODLE_BASE_URL}/my/", session=session)
     soup = BeautifulSoup(r.text, "html.parser")
     sesskey = get_sesskey(soup)
     
@@ -392,6 +456,7 @@ def scrape_attendance(creds: LoginRequest):
         courses = get_courses_via_ajax(session, sesskey)
     
     if not courses:
+        logger.warning("AJAX course fetch failed in attendance, trying link scraping fallback")
         seen = set()
         for link in soup.find_all("a", href=True):
             if "/course/view.php?id=" in link["href"]:
@@ -402,13 +467,17 @@ def scrape_attendance(creds: LoginRequest):
                         seen.add(cid)
                 except: pass
 
+    if not courses:
+         logger.error("No courses found to scrape attendance for.")
+         return AttendanceResponse(overall_percentage=0, total_present=0, total_sessions=0, courses=[])
+
     # Parallel scraping
     results = []
     total_present = 0
     total_sessions = 0
 
-    # Reduced workers to be safer with Moodle session concurrency
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # max_workers=2 is safer for session stability on some Moodle configs
+    with ThreadPoolExecutor(max_workers=2) as executor:
         # Pass the session directly
         scraped_results = list(executor.map(lambda c: scrape_single_course_attendance(session, c), courses))
 
@@ -419,7 +488,7 @@ def scrape_attendance(creds: LoginRequest):
             total_sessions += res.total_sessions
 
     overall = round((total_present / total_sessions * 100) if total_sessions else 0.0, 1)
-    logger.info(f"Attendance scraping done. Overall: {overall}%")
+    logger.info(f"Attendance scraping done for {len(results)} courses. Overall: {overall}%")
     return AttendanceResponse(
         overall_percentage=overall, total_present=total_present, 
         total_sessions=total_sessions, courses=results
@@ -445,24 +514,22 @@ def get_assignments_via_ajax(session, sesskey):
     
     assigns = []
     try:
-        r = session.post(url, json=payload, timeout=10)
+        r = safe_request("POST", url, session=session, json=payload, timeout=10)
         data = r.json()
         if data and not data[0].get("error"):
             events = data[0]['data']['events']
             for evt in events:
-                # Filter for assignments/quizzes
-                mod = evt.get('modulename', '').lower()
-                if mod in ['assign', 'quiz', 'forum'] or True: # Capture all action events
-                    due_ts = evt.get('timesort', 0)
-                    due_date = datetime.fromtimestamp(due_ts).strftime("%A, %d %B %Y, %I:%M %p")
-                    
-                    assigns.append(Assignment(
-                        id=evt.get('id', 0),
-                        name=evt.get('name', 'Untitled'),
-                        course=evt.get('course', {}).get('fullname', 'Unknown Course'),
-                        due_date=due_date,
-                        url=evt.get('url', '')
-                    ))
+                # Capture all action events
+                due_ts = evt.get('timesort', 0)
+                due_date = datetime.fromtimestamp(due_ts).strftime("%A, %d %B %Y, %I:%M %p")
+                
+                assigns.append(Assignment(
+                    id=evt.get('id', 0),
+                    name=evt.get('name', 'Untitled'),
+                    course=evt.get('course', {}).get('fullname', 'Unknown Course'),
+                    due_date=due_date,
+                    url=evt.get('url', '')
+                ))
     except Exception as e:
         logger.error(f"Assignment scraping error: {e}")
         
@@ -476,7 +543,7 @@ def scrape_assignments(creds: LoginRequest):
         return AssignmentsResponse(assignments=[])
         
     # Get sesskey
-    r = session.get(f"{MOODLE_BASE_URL}/my/")
+    r = safe_request("GET", f"{MOODLE_BASE_URL}/my/", session=session)
     soup = BeautifulSoup(r.text, "html.parser")
     sesskey = get_sesskey(soup)
     
@@ -496,3 +563,4 @@ except: pass
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
