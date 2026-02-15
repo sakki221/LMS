@@ -87,13 +87,12 @@ $("#login-form").addEventListener("submit", async (e) => {
         setStep("step-login", "done");
         setStep("step-courses", "active");
 
-        // 2. Dashboard — uses token
+        // 2. Dashboard — uses token, no body needed
         const dr = await fetch(`${API_BASE}/scrape/dashboard`, {
-            method: "POST", headers: authHeaders(),
-            body: JSON.stringify({})
+            method: "POST", headers: authHeaders()
         });
         const dd = await dr.json();
-        if (!dr.ok) throw new Error(dd.detail || "Dashboard fetch failed");
+        if (!dr.ok) throw new Error(typeof dd.detail === "string" ? dd.detail : "Dashboard fetch failed");
 
         appData.dashboard = dd;
         setStep("step-courses", "done");
@@ -104,12 +103,10 @@ $("#login-form").addEventListener("submit", async (e) => {
 
         const [attR, assR] = await Promise.allSettled([
             fetch(`${API_BASE}/scrape/attendance`, {
-                method: "POST", headers: authHeaders(),
-                body: JSON.stringify({})
+                method: "POST", headers: authHeaders()
             }).then(r => r.json()),
             fetch(`${API_BASE}/scrape/assignments`, {
-                method: "POST", headers: authHeaders(),
-                body: JSON.stringify({})
+                method: "POST", headers: authHeaders()
             }).then(r => r.json()),
         ]);
 

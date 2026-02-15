@@ -7,7 +7,7 @@ and exposes scraped data (dashboard, attendance) as JSON endpoints.
 Target: https://lmsug24.iiitkottayam.ac.in
 """
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -324,7 +324,7 @@ def read_root():
 
 
 @app.post("/scrape/dashboard", response_model=DashboardResponse)
-def scrape_dashboard(creds: LoginRequest = None, authorization: Optional[str] = Header(None)):
+def scrape_dashboard(creds: Optional[LoginRequest] = Body(default=None), authorization: Optional[str] = Header(None)):
     # Support both token-based and legacy credential-based auth
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ", 1)[1]
@@ -508,7 +508,7 @@ def scrape_single_course_attendance(session, course_obj):
         return CourseAttendance(course_name=cname, course_id=cid, has_attendance=False)
 
 @app.post("/scrape/attendance", response_model=AttendanceResponse)
-def scrape_attendance(creds: LoginRequest = None, authorization: Optional[str] = Header(None)):
+def scrape_attendance(creds: Optional[LoginRequest] = Body(default=None), authorization: Optional[str] = Header(None)):
     # Support both token-based and legacy credential-based auth
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ", 1)[1]
@@ -613,7 +613,7 @@ def get_assignments_via_ajax(session, sesskey):
     return assigns
 
 @app.post("/scrape/assignments", response_model=AssignmentsResponse)
-def scrape_assignments(creds: LoginRequest = None, authorization: Optional[str] = Header(None)):
+def scrape_assignments(creds: Optional[LoginRequest] = Body(default=None), authorization: Optional[str] = Header(None)):
     # Support both token-based and legacy credential-based auth
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ", 1)[1]
