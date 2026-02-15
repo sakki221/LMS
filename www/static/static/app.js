@@ -101,16 +101,6 @@ const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function escapeHtml(text) {
-    if (!text) return "";
-    return String(text)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-}
-
 function authHeaders() {
     // Token-only headers (no body)
     const h = {};
@@ -292,7 +282,7 @@ function renderDashboard() {
         if (a && a.has_attendance && a.total_sessions > 0) {
             const cls = a.percentage >= 80 ? "att-good" : a.percentage >= 70 ? "att-warn" : "att-bad";
             const bunk = getBunkInfo(a.present, a.total_sessions);
-            const bunkTag = bunk ? ` <span class="bunk-info bunk-${bunk.type}" style="font-size:.65rem;padding:.1rem .4rem;margin-left:.3rem">${escapeHtml(bunk.text)}</span>` : "";
+            const bunkTag = bunk ? ` <span class="bunk-info bunk-${bunk.type}" style="font-size:.65rem;padding:.1rem .4rem;margin-left:.3rem">${bunk.text}</span>` : "";
             attHtml = `<div class="cc-att"><span class="att-dot ${cls}"></span>${a.percentage}%  ·  ${a.present}P / ${a.absent}A${bunkTag}</div>`;
         }
 
@@ -303,8 +293,8 @@ function renderDashboard() {
         const card = document.createElement("div");
         card.className = "course-card";
         card.innerHTML = `
-            <div class="cc-code">${escapeHtml(code)}</div>
-            <div class="cc-name">${escapeHtml(name)}</div>
+            <div class="cc-code">${code}</div>
+            <div class="cc-name">${name}</div>
             ${attHtml}
         `;
         grid.appendChild(card);
@@ -328,12 +318,12 @@ function renderAttendanceList() {
         if (!c.has_attendance) return;
         const cls = c.percentage >= 80 ? "good" : c.percentage >= 70 ? "warn" : "bad";
         const bunk = getBunkInfo(c.present, c.total_sessions);
-        const bunkHtml = bunk ? `<div class="bunk-info bunk-${bunk.type}">${escapeHtml(bunk.text)}</div>` : "";
+        const bunkHtml = bunk ? `<div class="bunk-info bunk-${bunk.type}">${bunk.text}</div>` : "";
         const row = document.createElement("div");
         row.className = "att-row";
         row.innerHTML = `
             <div class="att-info">
-                <div class="att-name">${escapeHtml(c.course_name)}</div>
+                <div class="att-name">${c.course_name}</div>
                 <div class="att-meta">${c.present}P · ${c.absent}A · ${c.late}L — ${c.total_sessions} sessions</div>
                 ${bunkHtml}
             </div>
@@ -355,7 +345,7 @@ function openCourseDetail(course) {
     const cls = course.percentage >= 80 ? "var(--green)" : course.percentage >= 70 ? "var(--amber)" : "var(--red)";
 
     $("#detail-header").innerHTML = `
-        <div class="dh-name">${escapeHtml(course.course_name)}</div>
+        <div class="dh-name">${course.course_name}</div>
         <div class="dh-pct" style="color:${cls}">${course.percentage}%</div>
         <div class="dh-stats">
             <span class="dh-stat"><b>${course.present}</b> Present</span>
@@ -483,8 +473,8 @@ function showDayDetail(ds) {
         const sl = s.status.toLowerCase();
         const cls = sl.includes("absent") ? "absent" : sl.includes("late") ? "late" : "present";
         html += `<div class="dd-row">
-            <span class="dd-course">${escapeHtml(s.course)}</span>
-            <span class="sess-badge ${cls}">${escapeHtml(s.status)}</span>
+            <span class="dd-course">${s.course}</span>
+            <span class="sess-badge ${cls}">${s.status}</span>
         </div>`;
     });
     box.innerHTML = html;
@@ -519,13 +509,13 @@ function renderAssignments() {
         card.className = "assign-card";
         card.innerHTML = `
             <div class="assign-date-box">
-                <span class="adb-month">${escapeHtml(monStr)}</span>
-                <span class="adb-day">${escapeHtml(dayStr)}</span>
+                <span class="adb-month">${monStr}</span>
+                <span class="adb-day">${dayStr}</span>
             </div>
             <div class="assign-info">
-                <div class="assign-title">${escapeHtml(a.name)}</div>
-                <div class="assign-course">${escapeHtml(a.course || "")}</div>
-                <div class="assign-due">Due: ${escapeHtml(a.due_date)}</div>
+                <div class="assign-title">${a.name}</div>
+                <div class="assign-course">${a.course || ""}</div>
+                <div class="assign-due">Due: ${a.due_date}</div>
             </div>
         `;
         list.appendChild(card);

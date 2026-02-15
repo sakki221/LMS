@@ -308,7 +308,7 @@ def _get_authenticated_session_inner(username, password):
         return s
     except Exception as e:
         logger.error(f"Login error for {username}: {e}")
-        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid credentials or login failed")
 
 # ════════ ROUTES ════════
 
@@ -335,7 +335,8 @@ def login(creds: LoginRequest):
     except HTTPException as e:
         raise e
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
+        logger.error(f"Login error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid credentials or login failed")
 
 @app.get("/")
 def read_root():
